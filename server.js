@@ -15,6 +15,7 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date() }
 app.use('/api/auth', authRoutes);
 app.use('/api/items', itemRoutes);
 app.use('/api/sales', salesRoutes);
+app.use('/api/item-extras', require('./routes/item_extras'));
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, '0.0.0.0', () => {
