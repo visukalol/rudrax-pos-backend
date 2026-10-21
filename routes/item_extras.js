@@ -8,6 +8,11 @@
 const express = require('express');
 const pool = require('../db/pool');
 
+// Return DATE columns as plain 'YYYY-MM-DD' text. Otherwise node-pg turns them
+// into midnight in the server's time zone, and on a PC in India (UTC+5:30)
+// 2026-10-21 comes back as 2026-10-20T18:30Z, so the app shows the day before.
+require('pg').types.setTypeParser(1082, (v) => v);
+
 const router = express.Router();
 
 const fail = (res, e) => {
@@ -784,6 +789,52 @@ router.get('/deliveries/due', async (req, res) => {
   }
 });
 
+// GET /api/item-extras/deliveries/pending-invoices?today=YYYY-MM-DD&now=HH:MM
+//   Delivery days in the last 7 days (today included) where no invoice has
+//   been entered for that distributor. Today's delivery only counts once its
+//   expected time has passed (or right away when it has no time).
+//   An invoice counts when its invoice date is within a day of the delivery,
+//   or it was entered on the delivery day.
+//   -> [{ distributor_id, name, delivery_time, delivery_note, delivery_date, is_today }]
+router.get('/deliveries/pending-invoices', async (req, res) => {
+  const today = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.today || '')) ? req.query.today : null;
+  const now = /^\d{1,2}:\d{2}$/.test(String(req.query.now || '')) ? req.query.now : '23:59';
+  if (!today) return res.status(400).json({ error: 'today (YYYY-MM-DD) is required' });
+  const sql = (withInvoices, withCreated) => `
+    WITH days AS (
+      SELECT gs::date AS delivery_date
+        FROM generate_series($1::date - 6, $1::date, interval '1 day') gs
+    )
+    SELECT d.distributor_id, d.name, d.delivery_time, d.delivery_note,
+           to_char(x.delivery_date, 'YYYY-MM-DD') AS delivery_date,
+           (x.delivery_date = $1::date) AS is_today
+      FROM days x
+      JOIN distributor_delivery_days dd ON dd.day_of_week = EXTRACT(DOW FROM x.delivery_date)
+      JOIN distributors d ON d.distributor_id = dd.distributor_id
+      LEFT JOIN delivery_reminders r ON r.distributor_id = d.distributor_id AND r.delivery_date = x.delivery_date
+     WHERE COALESCE(d.is_active, TRUE)
+       ${withCreated ? 'AND x.delivery_date >= dd.created_at' : 'AND x.delivery_date = $1::date'}
+       AND (x.delivery_date < $1::date OR d.delivery_time IS NULL OR d.delivery_time <= $2::time)
+       AND (r.status IS NULL OR (r.status = 'snoozed' AND r.snoozed_until <= now()))
+       ${withInvoices ? `AND NOT EXISTS (
+             SELECT 1 FROM purchase_invoices pi
+              WHERE pi.distributor_id = d.distributor_id
+                AND (pi.invoice_date BETWEEN x.delivery_date - 1 AND x.delivery_date + 1
+                     OR pi.created_at::date = x.delivery_date))` : ''}
+     ORDER BY x.delivery_date, d.delivery_time NULLS LAST, d.name`;
+  // Works before every migration is in: falls back step by step.
+  const tries = [[true, true], [true, false], [false, true], [false, false]];
+  for (const [inv, created] of tries) {
+    try {
+      const { rows } = await pool.query(sql(inv, created), [today, now]);
+      return res.json(rows);
+    } catch (e) {
+      if (!['42P01', '42703'].includes(e.code)) return fail(res, e);
+    }
+  }
+  res.json([]);
+});
+
 // POST /api/item-extras/deliveries/remind
 //   { distributorId, date, status: 'received' | 'dismissed' | 'snoozed', snoozeMinutes, actedBy }
 router.post('/deliveries/remind', async (req, res) => {
@@ -796,7 +847,7 @@ router.post('/deliveries/remind', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `INSERT INTO delivery_reminders (distributor_id, delivery_date, status, snoozed_until, acted_by)
-       VALUES ($1, $2::date, $3, CASE WHEN $3 = 'snoozed' THEN now() + ($4::int * interval '1 minute') END, $5)
+       VALUES ($1, $2::date, $3::text, CASE WHEN $3::text = 'snoozed' THEN now() + ($4::int * interval '1 minute') END, $5::text)
        ON CONFLICT (distributor_id, delivery_date) DO UPDATE
          SET status = EXCLUDED.status, snoozed_until = EXCLUDED.snoozed_until,
              acted_by = EXCLUDED.acted_by, acted_at = now()
@@ -830,6 +881,144 @@ router.get('/invoices', async (_req, res) => {
     res.json(rows);
   } catch (e) {
     if (e.code === '42P01') return res.status(400).json({ error: 'Run migration_015_purchase_invoices.sql in Neon first' });
+    fail(res, e);
+  }
+});
+
+// ---- Excel export ---------------------------------------------------------
+const { buildXlsx } = require('./xlsx_writer');
+
+const INVOICE_COLUMNS = [
+  { header: 'Invoice date', width: 14, type: 'date' },
+  { header: 'Distributor', width: 26 },
+  { header: 'Invoice #', width: 16 },
+  { header: 'Items', width: 8, type: 'int' },
+  { header: 'Units', width: 9, type: 'int' },
+  { header: 'Total', width: 13, type: 'money' },
+  { header: 'Cost updated', width: 13 },
+  { header: 'Notes', width: 30 },
+  { header: 'Entered by', width: 18 },
+  { header: 'Entered at', width: 20 },
+];
+const LINE_COLUMNS = [
+  { header: 'Invoice date', width: 14, type: 'date' },
+  { header: 'Distributor', width: 24 },
+  { header: 'Invoice #', width: 16 },
+  { header: 'Item', width: 34 },
+  { header: 'SKU', width: 12 },
+  { header: 'Cases', width: 8, type: 'number' },
+  { header: 'Units / case', width: 11, type: 'int' },
+  { header: '+ Units', width: 9, type: 'int' },
+  { header: 'Qty (units)', width: 11, type: 'int' },
+  { header: 'Unit cost', width: 11, type: 'money' },
+  { header: 'Line total', width: 12, type: 'money' },
+  { header: 'Cost before', width: 12, type: 'money' },
+  { header: 'Stock before', width: 12, type: 'int' },
+  { header: 'Stock after', width: 11, type: 'int' },
+];
+
+const dateOnly = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v || '').slice(0, 10));
+const n = (v) => (v === null || v === undefined ? null : Number(v));
+
+function lineRow(l) {
+  return [
+    dateOnly(l.invoice_date), l.distributor_name, l.invoice_number, l.name, l.sku,
+    n(l.cases), n(l.units_per_case), n(l.extra_units), n(l.qty_units), n(l.unit_cost), n(l.line_total),
+    n(l.old_cost), n(l.old_qty), l.old_qty === null ? null : Number(l.old_qty) + Number(l.qty_units),
+  ];
+}
+
+function sendXlsx(res, fileName, sheets) {
+  const buf = buildXlsx(sheets);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${fileName.replace(/[^\w.-]+/g, '_')}"`);
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
+}
+
+// GET /api/item-extras/invoices/export?q=&from=YYYY-MM-DD&to=YYYY-MM-DD
+//   -> invoices.xlsx with two sheets: Invoices and Invoice lines
+router.get('/invoices/export', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+  const from = isDate(req.query.from) ? req.query.from : null;
+  const to = isDate(req.query.to) ? req.query.to : null;
+  const where = `WHERE ($1::text = '' OR i.invoice_number ILIKE '%' || $1::text || '%' OR d.name ILIKE '%' || $1::text || '%')
+                   AND ($2::date IS NULL OR i.invoice_date >= $2::date)
+                   AND ($3::date IS NULL OR i.invoice_date <= $3::date)`;
+  try {
+    const heads = (await pool.query(
+      `SELECT i.*, d.name AS distributor_name,
+              COUNT(l.line_id)::int AS line_count, COALESCE(SUM(l.qty_units), 0)::int AS total_units
+         FROM purchase_invoices i
+         LEFT JOIN distributors d ON d.distributor_id = i.distributor_id
+         LEFT JOIN purchase_invoice_lines l ON l.invoice_id = i.invoice_id
+        ${where}
+        GROUP BY i.invoice_id, d.name
+        ORDER BY i.invoice_date DESC, i.invoice_id DESC`,
+      [q, from, to]
+    )).rows;
+    const lines = (await pool.query(
+      `SELECT l.*, it.name, it.sku, i.invoice_number, i.invoice_date, d.name AS distributor_name
+         FROM purchase_invoice_lines l
+         JOIN purchase_invoices i ON i.invoice_id = l.invoice_id
+         LEFT JOIN distributors d ON d.distributor_id = i.distributor_id
+         LEFT JOIN items it ON it.item_id = l.item_id
+        ${where}
+        ORDER BY i.invoice_date DESC, i.invoice_id DESC, l.line_id`,
+      [q, from, to]
+    )).rows;
+
+    const sum = (rows, k) => rows.reduce((s, r) => s + Number(r[k] || 0), 0);
+    sendXlsx(res, `invoices_${new Date().toISOString().slice(0, 10)}.xlsx`, [
+      {
+        name: 'Invoices',
+        columns: INVOICE_COLUMNS,
+        rows: heads.map((h) => [
+          dateOnly(h.invoice_date), h.distributor_name, h.invoice_number, h.line_count, h.total_units,
+          n(h.total_amount), h.cost_updated ? 'Yes' : 'No', h.notes, h.created_by,
+          h.created_at ? new Date(h.created_at).toISOString().replace('T', ' ').slice(0, 16) : null,
+        ]),
+        totals: { label: `Total (${heads.length})`, values: { 3: sum(heads, 'line_count'), 4: sum(heads, 'total_units'), 5: sum(heads, 'total_amount') } },
+      },
+      {
+        name: 'Invoice lines',
+        columns: LINE_COLUMNS,
+        rows: lines.map(lineRow),
+        totals: { label: 'Total', values: { 8: sum(lines, 'qty_units'), 10: sum(lines, 'line_total') } },
+      },
+    ]);
+  } catch (e) {
+    if (e.code === '42P01') return res.status(400).json({ error: 'Run migration_015_purchase_invoices.sql in Neon first' });
+    fail(res, e);
+  }
+});
+
+// GET /api/item-extras/invoices/:id/export -> one invoice as .xlsx
+router.get('/invoices/:id/export', async (req, res) => {
+  try {
+    const head = (await pool.query(
+      `SELECT i.*, d.name AS distributor_name FROM purchase_invoices i
+         LEFT JOIN distributors d ON d.distributor_id = i.distributor_id WHERE i.invoice_id = $1`, [req.params.id]
+    )).rows[0];
+    if (!head) return res.status(404).json({ error: 'Invoice not found' });
+    const lines = (await pool.query(
+      `SELECT l.*, it.name, it.sku, $2::text AS invoice_number, $3::date AS invoice_date, $4::text AS distributor_name
+         FROM purchase_invoice_lines l LEFT JOIN items it ON it.item_id = l.item_id
+        WHERE l.invoice_id = $1 ORDER BY l.line_id`,
+      [req.params.id, head.invoice_number, dateOnly(head.invoice_date), head.distributor_name]
+    )).rows;
+    const total = lines.reduce((s, l) => s + Number(l.line_total || 0), 0);
+    const units = lines.reduce((s, l) => s + Number(l.qty_units || 0), 0);
+    sendXlsx(res, `invoice_${head.distributor_name || 'distributor'}_${head.invoice_number}.xlsx`, [
+      {
+        name: `Invoice ${head.invoice_number}`,
+        columns: LINE_COLUMNS,
+        rows: lines.map(lineRow),
+        totals: { label: 'Total', values: { 8: units, 10: total } },
+      },
+    ]);
+  } catch (e) {
     fail(res, e);
   }
 });
@@ -937,5 +1126,101 @@ router.post('/invoices', async (req, res) => {
     client.release();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Distributors screen (Items section) - migration 016
+// ---------------------------------------------------------------------------
+
+// GET /api/item-extras/distributors
+//   -> every distributor with its details, delivery days and how many items it supplies
+router.get('/distributors', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT d.*,
+              COALESCE((SELECT array_agg(dd.day_of_week ORDER BY dd.day_of_week)
+                          FROM distributor_delivery_days dd WHERE dd.distributor_id = d.distributor_id), '{}') AS days,
+              (SELECT COUNT(*)::int FROM item_distributors x WHERE x.distributor_id = d.distributor_id) AS item_count
+         FROM distributors d
+        ORDER BY d.name`
+    );
+    res.json(rows);
+  } catch (e) {
+    if (e.code === '42P01' || e.code === '42703') {
+      return res.status(400).json({ error: 'Run migration_016_distributor_details.sql in Neon first' });
+    }
+    fail(res, e);
+  }
+});
+
+// Body: { name, contactName, phone, email, address, accountNumber, salesRep, salesRepPhone,
+//         paymentTerms, minOrderAmount, notes, isActive, days: [0..6], deliveryTime: 'HH:MM', deliveryNote }
+function distributorValues(b) {
+  const t = (v) => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());
+  const money = Number(b.minOrderAmount);
+  return [
+    String(b.name || '').trim(),
+    t(b.contactName), t(b.phone), t(b.email), t(b.address), t(b.accountNumber),
+    t(b.salesRep), t(b.salesRepPhone), t(b.paymentTerms),
+    b.minOrderAmount === '' || b.minOrderAmount == null || !Number.isFinite(money) ? null : money,
+    t(b.notes), b.isActive !== false,
+    /^\d{1,2}:\d{2}/.test(String(b.deliveryTime || '')) ? String(b.deliveryTime) : null,
+    t(b.deliveryNote),
+  ];
+}
+
+async function saveDeliveryDays(client, id, days) {
+  const list = [...new Set((Array.isArray(days) ? days : []).map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))];
+  // Only remove days that were dropped and add new ones, so an existing
+  // day keeps the date it was set (used by the invoice reminders).
+  await client.query('DELETE FROM distributor_delivery_days WHERE distributor_id = $1 AND NOT (day_of_week = ANY($2::smallint[]))', [id, list]);
+  for (const d of list) {
+    await client.query(
+      'INSERT INTO distributor_delivery_days (distributor_id, day_of_week) VALUES ($1, $2) ON CONFLICT DO NOTHING', [id, d]
+    );
+  }
+  return list;
+}
+
+async function saveDistributor(req, res, id) {
+  if (!String(req.body.name || '').trim()) return res.status(400).json({ error: 'Distributor name is required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const v = distributorValues(req.body);
+    const cols = `name, contact_name, phone, email, address, account_number, sales_rep, sales_rep_phone,
+                  payment_terms, min_order_amount, notes, is_active, delivery_time, delivery_note`;
+    const row = id
+      ? (await client.query(
+          `UPDATE distributors SET (${cols}) = ($2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            WHERE distributor_id = $1 RETURNING *`,
+          [id, ...v]
+        )).rows[0]
+      : (await client.query(
+          `INSERT INTO distributors (${cols}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+          v
+        )).rows[0];
+    if (!row) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Distributor not found' });
+    }
+    const days = await saveDeliveryDays(client, row.distributor_id, req.body.days);
+    await client.query('COMMIT');
+    res.status(id ? 200 : 201).json({ ...row, days });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e.code === '23505') return res.status(400).json({ error: 'A distributor with that name already exists' });
+    if (e.code === '42P01' || e.code === '42703') {
+      return res.status(400).json({ error: 'Run migration_016_distributor_details.sql in Neon first' });
+    }
+    fail(res, e);
+  } finally {
+    client.release();
+  }
+}
+
+// POST /api/item-extras/distributors      -> new distributor
+router.post('/distributors', (req, res) => saveDistributor(req, res, null));
+// PUT  /api/item-extras/distributors/:id  -> update
+router.put('/distributors/:id', (req, res) => saveDistributor(req, res, Number(req.params.id)));
 
 module.exports = router;
