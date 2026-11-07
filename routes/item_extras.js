@@ -292,6 +292,39 @@ router.get('/groups', async (_req, res) => {
   }
 });
 
+// GET /api/item-extras/groups/memberships -> [{ item_id, group_id, name }]
+// (an item belongs to one group only; the group screen shows where each item is)
+router.get('/groups/memberships', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT ON (m.item_id) m.item_id, g.group_id, g.name
+         FROM item_group_members m JOIN item_groups g ON g.group_id = m.group_id
+        ORDER BY m.item_id, g.group_id`
+    );
+    res.json(rows);
+  } catch (e) {
+    fail(res, e);
+  }
+});
+
+// GET /api/item-extras/groups/register -> active groups with their item ids,
+// for the Groups tab of the cash register.
+router.get('/groups/register', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT g.*, COALESCE(array_agg(m.item_id ORDER BY m.item_id) FILTER (WHERE m.item_id IS NOT NULL), '{}') AS item_ids
+         FROM item_groups g
+         LEFT JOIN item_group_members m ON m.group_id = g.group_id
+        WHERE COALESCE(g.is_active, TRUE)
+        GROUP BY g.group_id
+        ORDER BY g.is_favourite DESC NULLS LAST, g.name`
+    );
+    res.json(rows);
+  } catch (e) {
+    fail(res, e);
+  }
+});
+
 // GET /api/item-extras/groups/:id/items -> [item_id, ...]
 router.get('/groups/:id/items', async (req, res) => {
   try {
@@ -433,11 +466,16 @@ router.post('/items/:id/apply-group-price', async (req, res) => {
 });
 
 // PUT /api/item-extras/groups/:id/members  { itemIds: [1, 2, 3] }  -> replaces the members
+// An item is in one group only: items added here are taken out of any other group.
 router.put('/groups/:id/members', async (req, res) => {
   const ids = Array.isArray(req.body.itemIds) ? req.body.itemIds.map(Number).filter(Boolean) : [];
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const moved = (await client.query(
+      'DELETE FROM item_group_members WHERE item_id = ANY($2::int[]) AND group_id <> $1',
+      [req.params.id, ids]
+    )).rowCount;
     await client.query('DELETE FROM item_group_members WHERE group_id = $1', [req.params.id]);
     for (const itemId of ids) {
       await client.query(
@@ -448,7 +486,7 @@ router.put('/groups/:id/members', async (req, res) => {
     await client.query('COMMIT');
     // after the commit, so a missing migration can't undo the member change
     const applied = await applyGroupPrice(pool, req.params.id);
-    res.json({ groupId: Number(req.params.id), itemCount: ids.length, applied });
+    res.json({ groupId: Number(req.params.id), itemCount: ids.length, applied, moved });
   } catch (e) {
     await client.query('ROLLBACK');
     fail(res, e);
@@ -1062,9 +1100,13 @@ router.post('/invoices', async (req, res) => {
     .filter((l) => l.itemId && l.qty > 0);
   const invoiceNumber = String(b.invoiceNumber || '').trim();
   if (!b.distributorId || !invoiceNumber) return res.status(400).json({ error: 'Distributor and invoice number are required' });
-  if (!lines.length) return res.status(400).json({ error: 'Add at least one item with a quantity' });
+  // Quick invoice: no item lines, just the invoice total (cost).
+  const quickTotal = Math.round(Math.max(num(b.totalAmount), 0) * 100) / 100;
+  if (!lines.length && !(quickTotal > 0)) {
+    return res.status(400).json({ error: 'Add at least one item with a quantity, or enter the invoice total' });
+  }
   const date = /^\d{4}-\d{2}-\d{2}$/.test(String(b.invoiceDate || '')) ? b.invoiceDate : null;
-  const total = lines.reduce((s, l) => s + l.total, 0);
+  const total = lines.length ? lines.reduce((s, l) => s + l.total, 0) : quickTotal;
   const updateCost = b.updateCost !== false;
 
   const client = await pool.connect();
@@ -1152,15 +1194,27 @@ router.get('/distributors', async (_req, res) => {
   }
 });
 
-// Body: { name, contactName, phone, email, address, accountNumber, salesRep, salesRepPhone,
+// Body: { name, email, address, accountNumber, salesReps: [{ name, phone }],
 //         paymentTerms, minOrderAmount, notes, isActive, days: [0..6], deliveryTime: 'HH:MM', deliveryNote }
+// (contact_name / phone are no longer edited - sales reps replace them.)
+function cleanReps(list) {
+  return (Array.isArray(list) ? list : [])
+    .map((r) => ({ name: String((r && r.name) || '').trim().slice(0, 120), phone: String((r && r.phone) || '').trim().slice(0, 40) }))
+    .filter((r) => r.name || r.phone)
+    .slice(0, 20);
+}
+
 function distributorValues(b) {
   const t = (v) => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());
   const money = Number(b.minOrderAmount);
+  const reps = cleanReps(b.salesReps);
   return [
     String(b.name || '').trim(),
-    t(b.contactName), t(b.phone), t(b.email), t(b.address), t(b.accountNumber),
-    t(b.salesRep), t(b.salesRepPhone), t(b.paymentTerms),
+    t(b.email), t(b.address), t(b.accountNumber),
+    // first rep also kept in the old columns, for anything that still reads them
+    reps.length ? t(reps[0].name) : null, reps.length ? t(reps[0].phone) : null,
+    JSON.stringify(reps),
+    t(b.paymentTerms),
     b.minOrderAmount === '' || b.minOrderAmount == null || !Number.isFinite(money) ? null : money,
     t(b.notes), b.isActive !== false,
     /^\d{1,2}:\d{2}/.test(String(b.deliveryTime || '')) ? String(b.deliveryTime) : null,
@@ -1187,16 +1241,16 @@ async function saveDistributor(req, res, id) {
   try {
     await client.query('BEGIN');
     const v = distributorValues(req.body);
-    const cols = `name, contact_name, phone, email, address, account_number, sales_rep, sales_rep_phone,
+    const cols = `name, email, address, account_number, sales_rep, sales_rep_phone, sales_reps,
                   payment_terms, min_order_amount, notes, is_active, delivery_time, delivery_note`;
     const row = id
       ? (await client.query(
-          `UPDATE distributors SET (${cols}) = ($2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+          `UPDATE distributors SET (${cols}) = ($2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14)
             WHERE distributor_id = $1 RETURNING *`,
           [id, ...v]
         )).rows[0]
       : (await client.query(
-          `INSERT INTO distributors (${cols}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+          `INSERT INTO distributors (${cols}) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13) RETURNING *`,
           v
         )).rows[0];
     if (!row) {
@@ -1209,6 +1263,9 @@ async function saveDistributor(req, res, id) {
   } catch (e) {
     await client.query('ROLLBACK');
     if (e.code === '23505') return res.status(400).json({ error: 'A distributor with that name already exists' });
+    if (e.code === '42703' && /sales_reps/.test(e.message)) {
+      return res.status(400).json({ error: 'Run migration_019_distributor_sales_reps.sql in Neon first' });
+    }
     if (e.code === '42P01' || e.code === '42703') {
       return res.status(400).json({ error: 'Run migration_016_distributor_details.sql in Neon first' });
     }
@@ -1222,5 +1279,184 @@ async function saveDistributor(req, res, id) {
 router.post('/distributors', (req, res) => saveDistributor(req, res, null));
 // PUT  /api/item-extras/distributors/:id  -> update
 router.put('/distributors/:id', (req, res) => saveDistributor(req, res, Number(req.params.id)));
+
+// ---------------------------------------------------------------------------
+// App settings (migration 018) - e.g. owner_email
+// ---------------------------------------------------------------------------
+router.get('/settings/:key', async (req, res) => {
+  try {
+    const r = (await pool.query('SELECT value FROM app_settings WHERE key = $1', [req.params.key])).rows[0];
+    res.json({ key: req.params.key, value: r ? r.value : null });
+  } catch (e) {
+    if (e.code === '42P01') return res.json({ key: req.params.key, value: null });
+    fail(res, e);
+  }
+});
+
+router.put('/settings/:key', async (req, res) => {
+  try {
+    const value = req.body.value === undefined || req.body.value === null ? null : String(req.body.value).trim();
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [req.params.key, value]
+    );
+    res.json({ key: req.params.key, value });
+  } catch (e) {
+    if (e.code === '42P01') return res.status(400).json({ error: 'Run migration_018_promotions_settings.sql in Neon first' });
+    fail(res, e);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Promotions (migration 018) - group-level offers
+// ---------------------------------------------------------------------------
+const PROMO_TYPES = ['BOGO', 'COMBO', 'DISCOUNT', 'HAPPY_HOUR'];
+const PROMO_MIGRATION = 'Run migration_018_promotions_settings.sql in Neon first';
+
+// GET /api/item-extras/promotions
+//   -> [{ ...promotion, groups: [{ group_id, name, role, qty, item_count }] }]
+// GET /api/item-extras/promotions?register=1
+//   -> only active ones, each group also with item_ids (for the cash register)
+router.get('/promotions', async (req, res) => {
+  const forRegister = req.query.register === '1';
+  try {
+    const promos = (await pool.query(
+      `SELECT p.*
+         FROM promotions p
+        ${forRegister ? 'WHERE p.is_active = TRUE AND (p.end_date IS NULL OR p.end_date >= CURRENT_DATE - 1)' : ''}
+        ORDER BY p.is_active DESC, p.name`
+    )).rows;
+    const groups = (await pool.query(
+      `SELECT pg.promotion_id, pg.group_id, pg.role, pg.qty, pg.sort_order, g.name,
+              COALESCE(array_agg(m.item_id) FILTER (WHERE m.item_id IS NOT NULL), '{}') AS item_ids
+         FROM promotion_groups pg
+         JOIN item_groups g ON g.group_id = pg.group_id
+         LEFT JOIN item_group_members m ON m.group_id = pg.group_id
+        GROUP BY pg.promotion_id, pg.group_id, pg.role, pg.qty, pg.sort_order, g.name
+        ORDER BY pg.sort_order`
+    )).rows;
+    const byPromo = {};
+    for (const g of groups) {
+      (byPromo[g.promotion_id] = byPromo[g.promotion_id] || []).push({
+        group_id: g.group_id, name: g.name, role: g.role, qty: g.qty,
+        item_count: g.item_ids.length, ...(forRegister ? { item_ids: g.item_ids } : {}),
+      });
+    }
+    res.json(promos.map((p) => ({ ...p, groups: byPromo[p.promotion_id] || [] })));
+  } catch (e) {
+    if (e.code === '42P01') return forRegister ? res.json([]) : res.status(400).json({ error: PROMO_MIGRATION });
+    fail(res, e);
+  }
+});
+
+function promoValues(b) {
+  const int = (v) => (v === '' || v == null || !Number.isFinite(Number(v)) ? null : Math.round(Number(v)));
+  const dec = (v) => (v === '' || v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+  const time = (v) => (/^\d{1,2}:\d{2}/.test(String(v || '')) ? String(v) : null);
+  const date = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : null);
+  const days = [...new Set((Array.isArray(b.days) ? b.days : []).map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))];
+  return [
+    String(b.name || '').trim(), b.promoType, b.isActive !== false,
+    int(b.buyQty), int(b.getQty), dec(b.getDiscountPct),
+    ['PCT', 'AMT'].includes(b.discountType) ? b.discountType : null, dec(b.discountValue),
+    dec(b.comboPrice), Math.max(int(b.minQty) || 1, 1),
+    days, time(b.startTime), time(b.endTime), date(b.startDate), date(b.endDate),
+    String(b.notes || '').trim() || null,
+  ];
+}
+
+function promoError(b) {
+  if (!String(b.name || '').trim()) return 'Give the promotion a name';
+  if (!PROMO_TYPES.includes(b.promoType)) return 'Pick the promotion type';
+  const groups = Array.isArray(b.groups) ? b.groups : [];
+  const has = (role) => groups.some((g) => g.role === role && g.groupId);
+  if (b.promoType === 'BOGO') {
+    if (!(Number(b.buyQty) >= 1) || !(Number(b.getQty) >= 1)) return 'Enter how many to buy and how many they get';
+    if (!has('BUY')) return 'Pick the group customers buy from';
+  }
+  if (b.promoType === 'COMBO') {
+    if (groups.filter((g) => g.role === 'COMBO' && g.groupId).length < 2) return 'A combo needs at least two groups';
+    if (!(Number(b.comboPrice) > 0)) return 'Enter the combo price';
+  }
+  if (b.promoType === 'DISCOUNT' || b.promoType === 'HAPPY_HOUR') {
+    if (!has('TARGET')) return 'Pick at least one group';
+    if (!(Number(b.discountValue) > 0)) return 'Enter the discount';
+    if (b.discountType === 'PCT' && Number(b.discountValue) > 100) return 'A % discount can\'t be more than 100';
+  }
+  if (b.promoType === 'HAPPY_HOUR' && (!b.startTime || !b.endTime)) return 'Happy hour needs a start and end time';
+  return null;
+}
+
+async function savePromotion(req, res, id) {
+  const err = promoError(req.body);
+  if (err) return res.status(400).json({ error: err });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const v = promoValues(req.body);
+    const cols = `name, promo_type, is_active, buy_qty, get_qty, get_discount_pct, discount_type, discount_value,
+                  combo_price, min_qty, days, start_time, end_time, start_date, end_date, notes`;
+    const row = id
+      ? (await client.query(
+          `UPDATE promotions SET (${cols}) = ($2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::smallint[], $13, $14, $15, $16, $17),
+                  updated_at = now()
+            WHERE promotion_id = $1 RETURNING *`,
+          [id, ...v]
+        )).rows[0]
+      : (await client.query(
+          `INSERT INTO promotions (${cols})
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::smallint[], $12, $13, $14, $15, $16) RETURNING *`,
+          v
+        )).rows[0];
+    if (!row) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+    await client.query('DELETE FROM promotion_groups WHERE promotion_id = $1', [row.promotion_id]);
+    let i = 0;
+    for (const g of Array.isArray(req.body.groups) ? req.body.groups : []) {
+      if (!g.groupId || !['BUY', 'GET', 'TARGET', 'COMBO'].includes(g.role)) continue;
+      await client.query(
+        'INSERT INTO promotion_groups (promotion_id, group_id, role, qty, sort_order) VALUES ($1, $2, $3, $4, $5)',
+        [row.promotion_id, g.groupId, g.role, Math.max(parseInt(g.qty, 10) || 1, 1), i++]
+      );
+    }
+    await client.query('COMMIT');
+    res.status(id ? 200 : 201).json(row);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e.code === '42P01') return res.status(400).json({ error: PROMO_MIGRATION });
+    fail(res, e);
+  } finally {
+    client.release();
+  }
+}
+
+router.post('/promotions', (req, res) => savePromotion(req, res, null));
+router.put('/promotions/:id', (req, res) => savePromotion(req, res, Number(req.params.id)));
+
+// PUT /api/item-extras/promotions/:id/active { isActive }
+router.put('/promotions/:id/active', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'UPDATE promotions SET is_active = $2, updated_at = now() WHERE promotion_id = $1 RETURNING *',
+      [req.params.id, req.body.isActive !== false]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Promotion not found' });
+    res.json(rows[0]);
+  } catch (e) {
+    fail(res, e);
+  }
+});
+
+router.delete('/promotions/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM promotions WHERE promotion_id = $1', [req.params.id]);
+    res.json({ deleted: Number(req.params.id) });
+  } catch (e) {
+    fail(res, e);
+  }
+});
 
 module.exports = router;
