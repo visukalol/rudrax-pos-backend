@@ -162,6 +162,149 @@ router.get('/:id/history', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// GET /api/items/:id/history/full  -> Item History screen (full/tabbed view)
+//   query params: period = 'month' | 'week' | 'day', range = number of buckets
+//
+// Returns:
+//   { summary: { lastSoldQty, qtyOnHand, totalSoldQty, lastPurchaseQty,
+//                lastPurchaseDate, lastSoldDate },
+//     buckets: [ { start, qty }, ... ]            (oldest -> newest, length = range)
+//     priceChanges: [ { changed_at, change_type, old_price, new_price, changed_by }, ... ]
+//     purchases: []   -- no purchasing/receiving module yet in this POC
+//     transactions: [ { ts, pos_order_id, transaction_id, is_return, qty, unit_price }, ... ] }
+//
+// IMPORTANT: declared before "/:id" so this doesn't get swallowed by the
+// ":id" param route.
+// ---------------------------------------------------------------------------
+function bucketStart(period, d) {
+  const day = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  if (period === 'day') return day;
+  if (period === 'month') return new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), 1));
+  // week -> Monday of this week
+  const dow = day.getUTCDay(); // 0=Sun..6=Sat
+  const diff = dow === 0 ? 6 : dow - 1;
+  const monday = new Date(day);
+  monday.setUTCDate(day.getUTCDate() - diff);
+  return monday;
+}
+function addPeriod(d, period, n) {
+  const r = new Date(d);
+  if (period === 'day') r.setUTCDate(r.getUTCDate() + n);
+  else if (period === 'week') r.setUTCDate(r.getUTCDate() + 7 * n);
+  else r.setUTCMonth(r.getUTCMonth() + n);
+  return r;
+}
+function dateKey(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+router.get('/:id/history/full', async (req, res) => {
+  const itemId = req.params.id;
+  const period = ['day', 'week', 'month'].includes(req.query.period) ? req.query.period : 'month';
+  const range = Math.max(1, Math.min(200, parseInt(req.query.range, 10) || 12));
+
+  try {
+    const { rows: itemRows } = await pool.query(
+      'SELECT item_id, sku, name, qty_on_hand FROM items WHERE item_id = $1',
+      [itemId]
+    );
+    if (!itemRows.length) return res.status(404).json({ error: 'Item not found' });
+    const item = itemRows[0];
+
+    // -------- summary (all-time totals, same source as the simple /history route)
+    const { rows: totals } = await pool.query(
+      `SELECT
+         COALESCE(SUM(sti.qty), 0) AS total_sold_qty,
+         MAX(st.created_at) AS last_sold_date,
+         (SELECT sti2.qty FROM sales_transaction_items sti2
+            JOIN sales_transactions st2 ON st2.transaction_id = sti2.transaction_id
+            WHERE sti2.item_id = $1
+            ORDER BY st2.created_at DESC LIMIT 1) AS last_sold_qty
+       FROM sales_transaction_items sti
+       JOIN sales_transactions st ON st.transaction_id = sti.transaction_id
+       WHERE sti.item_id = $1`,
+      [itemId]
+    );
+
+    // -------- qty graph buckets
+    const currentStart = bucketStart(period, new Date());
+    const starts = [];
+    for (let i = range - 1; i >= 0; i--) starts.push(addPeriod(currentStart, period, -i));
+    const earliest = starts[0];
+
+    const { rows: bucketRows } = await pool.query(
+      `SELECT date_trunc($2, st.created_at) AS bucket, SUM(sti.qty) AS qty
+       FROM sales_transaction_items sti
+       JOIN sales_transactions st ON st.transaction_id = sti.transaction_id
+       WHERE sti.item_id = $1 AND st.created_at >= $3 AND st.status <> 'VOID'
+       GROUP BY 1`,
+      [itemId, period, earliest.toISOString()]
+    );
+    const bucketMap = new Map(bucketRows.map((r) => [dateKey(new Date(r.bucket)), Number(r.qty) || 0]));
+    const buckets = starts.map((s) => ({ start: dateKey(s), qty: bucketMap.get(dateKey(s)) || 0 }));
+
+    // -------- price / cost change log (table + columns already used by /meta/price-change-log)
+    const { rows: priceChanges } = await pool.query(
+      `SELECT changed_at, change_type, old_price, new_price, changed_by
+       FROM price_change_log
+       WHERE item_id = $1
+       ORDER BY changed_at DESC
+       LIMIT 200`,
+      [itemId]
+    );
+
+    // -------- transaction history (sales + returns of this item)
+    const { rows: transactions } = await pool.query(
+      `SELECT st.created_at AS ts, st.pos_order_id, st.transaction_id,
+              (st.status = 'RETURN') AS is_return, sti.qty, sti.unit_price
+       FROM sales_transaction_items sti
+       JOIN sales_transactions st ON st.transaction_id = sti.transaction_id
+       WHERE sti.item_id = $1
+       ORDER BY st.created_at DESC
+       LIMIT 200`,
+      [itemId]
+    );
+
+    res.json({
+      summary: {
+        lastSoldQty: totals[0]?.last_sold_qty ?? null,
+        qtyOnHand: item.qty_on_hand,
+        totalSoldQty: Number(totals[0]?.total_sold_qty || 0),
+        // No purchasing/receiving module yet in this POC, so these are not tracked.
+        lastPurchaseQty: null,
+        lastPurchaseDate: null,
+        lastSoldDate: totals[0]?.last_sold_date ?? null,
+      },
+      buckets,
+      priceChanges,
+      purchases: [],
+      transactions,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/items/:id/favourite  -> Item catalog's star icon ("add/remove
+// from cash register"). A lightweight, single-column update so this quick
+// toggle doesn't have to go through the full-replace PUT /:id (which
+// requires every field, including sku/name).
+router.patch('/:id/favourite', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'UPDATE items SET is_favourite = $1 WHERE item_id = $2 RETURNING *',
+      [!!req.body.isFavourite, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // GET /api/items/:id   -> single item + its UPC list, for the Edit Item screen
 router.get('/:id', async (req, res) => {
   try {
@@ -231,6 +374,9 @@ async function logPriceChange(client, { itemId, sku, itemName, size, pack, chang
 // POST /api/items   (Add Item - General tab)
 router.post('/', async (req, res) => {
   const f = itemFieldsFromBody(req.body);
+  if (!f.sku || !f.name) {
+    return res.status(400).json({ error: 'SKU and item name are required' });
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -285,6 +431,9 @@ router.post('/', async (req, res) => {
 // PUT /api/items/:id   (Edit Item - General tab)
 router.put('/:id', async (req, res) => {
   const f = itemFieldsFromBody(req.body);
+  if (!f.sku || !f.name) {
+    return res.status(400).json({ error: 'SKU and item name are required' });
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -993,6 +1142,192 @@ router.post('/meta/item-groups', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Item Groups (Back Office) - full admin view used by ItemGroupsScreen /
+// AddItemGroupScreen and ApiService.listGroupsFull()/saveGroup()/
+// getGroupItemIds()/setGroupMembers(). Needs
+// migration_012_item_group_extras.sql applied (adds age_restriction,
+// is_favourite, is_active, price_sync, group_price, group_cost to
+// item_groups). An item belongs to at most one group, so setGroupMembers
+// below removes it from any other group it was in.
+// ---------------------------------------------------------------------------
+router.get('/meta/item-groups/full', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT g.*, COUNT(m.item_id)::int AS item_count
+       FROM item_groups g
+       LEFT JOIN item_group_members m ON m.group_id = g.group_id
+       GROUP BY g.group_id
+       ORDER BY g.name`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/meta/item-groups/:id/item-ids', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT item_id FROM item_group_members WHERE group_id = $1', [req.params.id]);
+    res.json(rows.map((r) => r.item_id));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Create a group with every field the Add/Edit Item Group page sets, not
+// just name/message/groupType.
+router.post('/meta/item-groups/full', async (req, res) => {
+  const { name, message, groupType, ageRestriction, isFavourite, isActive, priceSync, groupPrice, groupCost } = req.body;
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO item_groups (name, message, group_type, age_restriction, is_favourite, is_active, price_sync, group_price, group_cost)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [
+        name, message || null, groupType || 'ITEM_GROUP', ageRestriction ?? null,
+        !!isFavourite, isActive !== false, !!priceSync, groupPrice ?? null, groupCost ?? null,
+      ]
+    );
+    res.status(201).json({ ...rows[0], item_count: 0, applied: 0 });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'A group with that name already exists' });
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.put('/meta/item-groups/full/:id', async (req, res) => {
+  const { name, message, groupType, ageRestriction, isFavourite, isActive, priceSync, groupPrice, groupCost } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `UPDATE item_groups SET
+         name = COALESCE($1, name),
+         message = $2,
+         group_type = COALESCE($3, group_type),
+         age_restriction = $4,
+         is_favourite = $5,
+         is_active = $6,
+         price_sync = $7,
+         group_price = $8,
+         group_cost = $9
+       WHERE group_id = $10
+       RETURNING *`,
+      [
+        name ?? null, message ?? null, groupType ?? null, ageRestriction ?? null,
+        !!isFavourite, isActive !== false, !!priceSync, groupPrice ?? null, groupCost ?? null,
+        req.params.id,
+      ]
+    );
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    const group = rows[0];
+
+    // Re-price every existing member if group pricing is on - covers the
+    // case where the group price itself changed (membership changes are
+    // handled separately by setGroupMembers).
+    let applied = 0;
+    if (group.price_sync && group.group_price != null) {
+      const { rowCount } = await client.query(
+        `UPDATE items SET
+           retail_price = $1,
+           unit_cost = COALESCE($2, unit_cost)
+         WHERE item_id IN (SELECT item_id FROM item_group_members WHERE group_id = $3)
+           AND (retail_price IS DISTINCT FROM $1 OR ($2 IS NOT NULL AND unit_cost IS DISTINCT FROM $2))`,
+        [group.group_price, group.group_cost, req.params.id]
+      );
+      applied = rowCount;
+    }
+
+    await client.query('COMMIT');
+    res.json({ ...group, applied });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    if (err.code === '23505') return res.status(409).json({ error: 'A group with that name already exists' });
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Replaces a group's full membership list in one call. Since an item can
+// only be in one group, any requested item that belonged to a different
+// group is moved out of it first ("moved" in the response). Returns how
+// many items actually changed. Also (re-)applies group pricing to the new
+// full member list when price sync is on, so items added after the group
+// price was set still pick it up.
+router.put('/meta/item-groups/:groupId/members', async (req, res) => {
+  const { itemIds } = req.body;
+  if (!Array.isArray(itemIds)) return res.status(400).json({ error: 'itemIds must be an array' });
+  const gid = req.params.groupId;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: groupRows } = await client.query('SELECT * FROM item_groups WHERE group_id = $1', [gid]);
+    if (!groupRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    const group = groupRows[0];
+    const ids = itemIds.map((n) => parseInt(n, 10)).filter((n) => Number.isFinite(n));
+
+    let moved = 0;
+    if (ids.length) {
+      const { rows: others } = await client.query(
+        `SELECT item_id FROM item_group_members WHERE group_id <> $1 AND item_id = ANY($2::int[])`,
+        [gid, ids]
+      );
+      moved = others.length;
+      if (moved) {
+        await client.query(`DELETE FROM item_group_members WHERE group_id <> $1 AND item_id = ANY($2::int[])`, [gid, ids]);
+      }
+    }
+
+    // Drop members that are no longer in the requested list.
+    await client.query(
+      `DELETE FROM item_group_members WHERE group_id = $1 AND NOT (item_id = ANY($2::int[]))`,
+      [gid, ids.length ? ids : [0]]
+    );
+
+    // Add any newly-requested members.
+    for (const itemId of ids) {
+      await client.query(
+        `INSERT INTO item_group_members (group_id, item_id) VALUES ($1,$2) ON CONFLICT (group_id, item_id) DO NOTHING`,
+        [gid, itemId]
+      );
+    }
+
+    let applied = 0;
+    if (group.price_sync && group.group_price != null && ids.length) {
+      const { rowCount } = await client.query(
+        `UPDATE items SET
+           retail_price = $1,
+           unit_cost = COALESCE($2, unit_cost)
+         WHERE item_id = ANY($3::int[])
+           AND (retail_price IS DISTINCT FROM $1 OR ($2 IS NOT NULL AND unit_cost IS DISTINCT FROM $2))`,
+        [group.group_price, group.group_cost, ids]
+      );
+      applied = rowCount;
+    }
+
+    await client.query('COMMIT');
+    res.json({ applied, moved });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
 router.get('/:id/groups', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -1081,6 +1416,100 @@ router.post('/meta/departments', async (req, res) => {
       [storeId || 1, name, taxPct || 0, ageRestriction || null, surchargePct || 0, !!isFavourite]
     );
     res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Department Management (Back Office) - full admin view used by
+// DepartmentManagementScreen / ApiService.listDepartmentsFull() and friends.
+// Needs migration_010_department_extras.sql and
+// migration_011_department_flags_hours.sql applied (adds is_active,
+// is_non_taxable_override, allow_ebt, pricing_method, pricing_value_pct,
+// surcharge, flags, product_attributes, weekly_hours, special_hours to
+// the departments table).
+// ---------------------------------------------------------------------------
+router.get('/meta/departments/full', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT d.*, COUNT(i.item_id)::int AS item_count
+       FROM departments d
+       LEFT JOIN items i ON i.department_id = d.department_id AND i.is_active = TRUE
+       GROUP BY d.department_id
+       ORDER BY d.name`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Basic fields: name / tax rate / active-inactive. Keeps the legacy
+// `status` column ('ACTIVE'/'INACTIVE') in sync with the newer boolean
+// `is_active` column so older code that still reads `status` keeps working.
+router.put('/meta/departments/:id', async (req, res) => {
+  const { name, taxPct, isActive } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE departments SET
+         name = COALESCE($1, name),
+         tax_pct = COALESCE($2, tax_pct),
+         is_active = COALESCE($3, is_active),
+         status = CASE WHEN $3::boolean IS NULL THEN status WHEN $3::boolean THEN 'ACTIVE' ELSE 'INACTIVE' END
+       WHERE department_id = $4
+       RETURNING *`,
+      [name ?? null, taxPct ?? null, isActive ?? null, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Department not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Everything from the Edit Department panel beyond the basics: age
+// restriction, non-taxable/EBT flags, pricing method/value, surcharge,
+// free-form flags + product attributes, and the weekly/special hours grids.
+router.put('/meta/departments/:id/extras', async (req, res) => {
+  const {
+    ageRestriction, isNonTaxable, allowEbt, pricingMethod, pricingValuePct,
+    surcharge, flags, productAttributes, weeklyHours, specialHours,
+  } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE departments SET
+         age_restriction = $1,
+         is_non_taxable_override = $2,
+         allow_ebt = $3,
+         pricing_method = $4,
+         pricing_value_pct = $5,
+         surcharge = $6,
+         flags = $7,
+         product_attributes = $8,
+         weekly_hours = $9::jsonb,
+         special_hours = $10::jsonb
+       WHERE department_id = $11
+       RETURNING *`,
+      [
+        ageRestriction ?? null,
+        !!isNonTaxable,
+        !!allowEbt,
+        pricingMethod ?? null,
+        pricingValuePct ?? null,
+        surcharge ?? null,
+        Array.isArray(flags) ? flags.join(', ') : (flags ?? null),
+        productAttributes ?? null,
+        weeklyHours ? JSON.stringify(weeklyHours) : null,
+        specialHours ? JSON.stringify(specialHours) : null,
+        req.params.id,
+      ]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Department not found' });
+    res.json(rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server error' });
